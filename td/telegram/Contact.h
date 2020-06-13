@@ -1,5 +1,5 @@
 //
-// Copyright Aliaksei Levin (levlam@telegram.org), Arseny Smirnov (arseny30@gmail.com) 2014-2018
+// Copyright Aliaksei Levin (levlam@telegram.org), Arseny Smirnov (arseny30@gmail.com) 2014-2020
 //
 // Distributed under the Boost Software License, Version 1.0. (See accompanying
 // file LICENSE_1_0.txt or copy at http://www.boost.org/LICENSE_1_0.txt)
@@ -7,15 +7,15 @@
 #pragma once
 
 #include "td/telegram/SecretInputMedia.h"
+#include "td/telegram/td_api.h"
+#include "td/telegram/telegram_api.h"
 #include "td/telegram/UserId.h"
 #include "td/telegram/Version.h"
 
 #include "td/utils/common.h"
+#include "td/utils/Status.h"
 #include "td/utils/StringBuilder.h"
 #include "td/utils/tl_helpers.h"
-
-#include "td/telegram/td_api.h"
-#include "td/telegram/telegram_api.h"
 
 #include <functional>
 #include <tuple>
@@ -138,5 +138,8 @@ struct ContactHash {
            std::hash<std::string>()(contact.last_name_);
   }
 };
+
+Result<Contact> process_input_message_contact(tl_object_ptr<td_api::InputMessageContent> &&input_message_content)
+    TD_WARN_UNUSED_RESULT;
 
 }  // namespace td

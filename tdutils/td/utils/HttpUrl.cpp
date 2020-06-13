@@ -1,5 +1,5 @@
 //
-// Copyright Aliaksei Levin (levlam@telegram.org), Arseny Smirnov (arseny30@gmail.com) 2014-2018
+// Copyright Aliaksei Levin (levlam@telegram.org), Arseny Smirnov (arseny30@gmail.com) 2014-2020
 //
 // Distributed under the Boost Software License, Version 1.0. (See accompanying
 // file LICENSE_1_0.txt or copy at http://www.boost.org/LICENSE_1_0.txt)
@@ -10,6 +10,7 @@
 #include "td/utils/logging.h"
 #include "td/utils/misc.h"
 #include "td/utils/Parser.h"
+#include "td/utils/port/IPAddress.h"
 
 namespace td {
 
@@ -29,26 +30,20 @@ string HttpUrl::get_url() const {
     result += userinfo_;
     result += '@';
   }
-  if (is_ipv6_) {
-    result += '[';
-  }
   result += host_;
-  if (is_ipv6_) {
-    result += ']';
-  }
   if (specified_port_ > 0) {
     result += ':';
     result += to_string(specified_port_);
   }
-  CHECK(!query_.empty() && query_[0] == '/');
+  LOG_CHECK(!query_.empty() && query_[0] == '/') << query_;
   result += query_;
   return result;
 }
 
-Result<HttpUrl> parse_url(MutableSlice url, HttpUrl::Protocol default_protocol) {
+Result<HttpUrl> parse_url(Slice url, HttpUrl::Protocol default_protocol) {
   // url == [https?://][userinfo@]host[:port]
-  Parser parser(url);
-  string protocol_str = to_lower(parser.read_till_nofail(':'));
+  ConstParser parser(url);
+  string protocol_str = to_lower(parser.read_till_nofail(":/?#@[]"));
 
   HttpUrl::Protocol protocol;
   if (parser.start_with("://")) {
@@ -61,7 +56,7 @@ Result<HttpUrl> parse_url(MutableSlice url, HttpUrl::Protocol default_protocol) 
       return Status::Error("Unsupported URL protocol");
     }
   } else {
-    parser = Parser(url);
+    parser = ConstParser(url);
     protocol = default_protocol;
   }
   Slice userinfo_host_port = parser.read_till_nofail("/?#");
@@ -88,12 +83,18 @@ Result<HttpUrl> parse_url(MutableSlice url, HttpUrl::Protocol default_protocol) 
 
   bool is_ipv6 = false;
   if (!host.empty() && host[0] == '[' && host.back() == ']') {
-    host.remove_prefix(1);
-    host.remove_suffix(1);
+    IPAddress ip_address;
+    if (ip_address.init_ipv6_port(host.str(), 1).is_error()) {
+      return Status::Error("Wrong IPv6 address specified in the URL");
+    }
+    CHECK(ip_address.is_ipv6());
     is_ipv6 = true;
   }
   if (host.empty()) {
     return Status::Error("URL host is empty");
+  }
+  if (host == ".") {
+    return Status::Error("Host is invalid");
   }
 
   int specified_port = port;
@@ -111,7 +112,7 @@ Result<HttpUrl> parse_url(MutableSlice url, HttpUrl::Protocol default_protocol) 
     query.remove_suffix(1);
   }
   if (query.empty()) {
-    query = "/";
+    query = Slice("/");
   }
   string query_str;
   if (query[0] != '/') {
@@ -184,10 +185,8 @@ string get_url_query_file_name(const string &query) {
   return query_slice.str();
 }
 
-string get_url_file_name(const string &url) {
-  // TODO remove copy
-  string url_copy = url;
-  auto r_http_url = parse_url(url_copy);
+string get_url_file_name(Slice url) {
+  auto r_http_url = parse_url(url);
   if (r_http_url.is_error()) {
     LOG(WARNING) << "Receive wrong URL \"" << url << '"';
     return string();

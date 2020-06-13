@@ -1,5 +1,5 @@
 //
-// Copyright Aliaksei Levin (levlam@telegram.org), Arseny Smirnov (arseny30@gmail.com) 2014-2018
+// Copyright Aliaksei Levin (levlam@telegram.org), Arseny Smirnov (arseny30@gmail.com) 2014-2020
 //
 // Distributed under the Boost Software License, Version 1.0. (See accompanying
 // file LICENSE_1_0.txt or copy at http://www.boost.org/LICENSE_1_0.txt)
@@ -14,18 +14,14 @@ namespace td {
 
 bool DialogId::is_valid() const {
   switch (get_type()) {
-    case DialogType::User: {
+    case DialogType::User:
       return get_user_id().is_valid();
-    }
-    case DialogType::Chat: {
+    case DialogType::Chat:
       return get_chat_id().is_valid();
-    }
-    case DialogType::Channel: {
+    case DialogType::Channel:
       return get_channel_id().is_valid();
-    }
-    case DialogType::SecretChat: {
+    case DialogType::SecretChat:
       return get_secret_chat_id().is_valid();
-    }
     case DialogType::None:
       return false;
     default:
@@ -61,14 +57,14 @@ ChatId DialogId::get_chat_id() const {
   return ChatId(static_cast<int32>(-id));
 }
 
-SecretChatId DialogId::get_secret_chat_id() const {
-  CHECK(get_type() == DialogType::SecretChat);
-  return SecretChatId(static_cast<int32>(id - ZERO_SECRET_ID));
-}
-
 ChannelId DialogId::get_channel_id() const {
   CHECK(get_type() == DialogType::Channel);
   return ChannelId(static_cast<int32>(MAX_CHANNEL_ID - id));
+}
+
+SecretChatId DialogId::get_secret_chat_id() const {
+  CHECK(get_type() == DialogType::SecretChat);
+  return SecretChatId(static_cast<int32>(id - ZERO_SECRET_ID));
 }
 
 DialogId::DialogId(UserId user_id) {
@@ -103,8 +99,20 @@ DialogId::DialogId(SecretChatId chat_id) {
   }
 }
 
-DialogId::DialogId(const tl_object_ptr<telegram_api::dialogPeer> &dialog_peer) {
-  id = get_peer_id(dialog_peer->peer_);
+DialogId::DialogId(const tl_object_ptr<telegram_api::DialogPeer> &dialog_peer) {
+  CHECK(dialog_peer != nullptr);
+  switch (dialog_peer->get_id()) {
+    case telegram_api::dialogPeer::ID:
+      id = get_peer_id(static_cast<const telegram_api::dialogPeer *>(dialog_peer.get())->peer_);
+      break;
+    case telegram_api::dialogPeerFolder::ID:
+      LOG(ERROR) << "Receive unsupported " << to_string(dialog_peer);
+      id = 0;
+      break;
+    default:
+      id = 0;
+      UNREACHABLE();
+  }
 }
 
 DialogId::DialogId(const tl_object_ptr<telegram_api::Peer> &peer) : id(get_peer_id(peer)) {

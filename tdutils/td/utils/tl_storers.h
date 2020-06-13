@@ -1,16 +1,16 @@
 //
-// Copyright Aliaksei Levin (levlam@telegram.org), Arseny Smirnov (arseny30@gmail.com) 2014-2018
+// Copyright Aliaksei Levin (levlam@telegram.org), Arseny Smirnov (arseny30@gmail.com) 2014-2020
 //
 // Distributed under the Boost Software License, Version 1.0. (See accompanying
 // file LICENSE_1_0.txt or copy at http://www.boost.org/LICENSE_1_0.txt)
 //
 #pragma once
 
-#include "td/utils/int_types.h"
+#include "td/utils/common.h"
 #include "td/utils/logging.h"
-#include "td/utils/misc.h"
 #include "td/utils/Slice.h"
 #include "td/utils/StorerBase.h"
+#include "td/utils/UInt.h"
 
 #include <cstring>
 
@@ -21,7 +21,6 @@ class TlStorerUnsafe {
 
  public:
   explicit TlStorerUnsafe(unsigned char *buf) : buf_(buf) {
-    CHECK(is_aligned_pointer<4>(buf_));
   }
 
   TlStorerUnsafe(const TlStorerUnsafe &other) = delete;
@@ -29,13 +28,12 @@ class TlStorerUnsafe {
 
   template <class T>
   void store_binary(const T &x) {
-    std::memcpy(buf_, reinterpret_cast<const unsigned char *>(&x), sizeof(T));
+    std::memcpy(buf_, &x, sizeof(T));
     buf_ += sizeof(T);
   }
 
   void store_int(int32 x) {
-    *reinterpret_cast<int32 *>(buf_) = x;
-    buf_ += sizeof(int32);
+    store_binary<int32>(x);
   }
 
   void store_long(int64 x) {
@@ -62,6 +60,15 @@ class TlStorerUnsafe {
       *buf_++ = static_cast<unsigned char>(len & 255);
       *buf_++ = static_cast<unsigned char>((len >> 8) & 255);
       *buf_++ = static_cast<unsigned char>(len >> 16);
+    } else if (static_cast<uint64>(len) < (static_cast<uint64>(1) << 32)) {
+      *buf_++ = static_cast<unsigned char>(255);
+      *buf_++ = static_cast<unsigned char>(len & 255);
+      *buf_++ = static_cast<unsigned char>((len >> 8) & 255);
+      *buf_++ = static_cast<unsigned char>((len >> 16) & 255);
+      *buf_++ = static_cast<unsigned char>((len >> 24) & 255);
+      *buf_++ = static_cast<unsigned char>(0);
+      *buf_++ = static_cast<unsigned char>(0);
+      *buf_++ = static_cast<unsigned char>(0);
     } else {
       LOG(FATAL) << "String size " << len << " is too big to be stored";
     }
@@ -71,10 +78,10 @@ class TlStorerUnsafe {
     switch (len & 3) {
       case 1:
         *buf_++ = 0;
-      // fallthrough
+        // fallthrough
       case 2:
         *buf_++ = 0;
-      // fallthrough
+        // fallthrough
       case 3:
         *buf_++ = 0;
     }
@@ -119,8 +126,10 @@ class TlStorerCalcLength {
     size_t add = str.size();
     if (add < 254) {
       add += 1;
-    } else {
+    } else if (add < (1 << 24)) {
       add += 4;
+    } else {
+      add += 8;
     }
     add = (add + 3) & -4;
     length += add;
@@ -133,12 +142,10 @@ class TlStorerCalcLength {
 
 class TlStorerToString {
   std::string result;
-  int shift = 0;
+  size_t shift = 0;
 
   void store_field_begin(const char *name) {
-    for (int i = 0; i < shift; i++) {
-      result += ' ';
-    }
+    result.append(shift, ' ');
     if (name && name[0]) {
       result += name;
       result += " = ";
@@ -146,7 +153,7 @@ class TlStorerToString {
   }
 
   void store_field_end() {
-    result += "\n";
+    result += '\n';
   }
 
   void store_long(int64 value) {
@@ -156,14 +163,14 @@ class TlStorerToString {
   void store_binary(Slice data) {
     static const char *hex = "0123456789ABCDEF";
 
-    result.append("{ ");
+    result.append("{ ", 2);
     for (auto c : data) {
       unsigned char byte = c;
       result += hex[byte >> 4];
       result += hex[byte & 15];
       result += ' ';
     }
-    result.append("}");
+    result += '}';
   }
 
  public:
@@ -202,7 +209,7 @@ class TlStorerToString {
   void store_field(const char *name, const string &value) {
     store_field_begin(name);
     result += '"';
-    result.append(value.data(), value.size());
+    result += value;
     result += '"';
     store_field_end();
   }
@@ -222,25 +229,29 @@ class TlStorerToString {
     result.append("bytes [");
     store_long(static_cast<int64>(value.size()));
     result.append("] { ");
-    for (size_t i = 0; i < value.size(); i++) {
+    size_t len = min(static_cast<size_t>(64), value.size());
+    for (size_t i = 0; i < len; i++) {
       int b = value[static_cast<int>(i)] & 0xff;
       result += hex[b >> 4];
       result += hex[b & 15];
       result += ' ';
     }
-    result.append("}");
+    if (len < value.size()) {
+      result.append("...");
+    }
+    result += '}';
     store_field_end();
   }
 
   void store_field(const char *name, const UInt128 &value) {
     store_field_begin(name);
-    store_binary(Slice(reinterpret_cast<const unsigned char *>(&value), sizeof(value)));
+    store_binary(as_slice(value));
     store_field_end();
   }
 
   void store_field(const char *name, const UInt256 &value) {
     store_field_begin(name);
-    store_binary(Slice(reinterpret_cast<const unsigned char *>(&value), sizeof(value)));
+    store_binary(as_slice(value));
     store_field_end();
   }
 
@@ -252,16 +263,14 @@ class TlStorerToString {
   }
 
   void store_class_end() {
+    CHECK(shift >= 2);
     shift -= 2;
-    for (int i = 0; i < shift; i++) {
-      result += ' ';
-    }
+    result.append(shift, ' ');
     result += "}\n";
-    CHECK(shift >= 0);
   }
 
-  std::string str() const {
-    return result;
+  std::string move_as_str() {
+    return std::move(result);
   }
 };
 

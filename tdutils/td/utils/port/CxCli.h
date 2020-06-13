@@ -1,28 +1,37 @@
 //
-// Copyright Aliaksei Levin (levlam@telegram.org), Arseny Smirnov (arseny30@gmail.com) 2014-2018
+// Copyright Aliaksei Levin (levlam@telegram.org), Arseny Smirnov (arseny30@gmail.com) 2014-2020
 //
 // Distributed under the Boost Software License, Version 1.0. (See accompanying
 // file LICENSE_1_0.txt or copy at http://www.boost.org/LICENSE_1_0.txt)
 //
 #pragma once
 
+#pragma managed(push, off)
 #include "td/utils/port/config.h"
+#pragma managed(pop)
 
 #include "td/utils/common.h"
-#undef small
 
 #if TD_WINRT
 
+#pragma managed(push, off)
 #include "td/utils/port/wstring_convert.h"
+#pragma managed(pop)
 
 #include "collection.h"
 
+#pragma managed(push, off)
 #include <cstdint>
 #include <map>
 #include <mutex>
+#pragma managed(pop)
+
+#undef small
 
 #define REF_NEW ref new
 #define CLRCALL
+#define DEPRECATED_ATTRIBUTE(message) ::Windows::Foundation::Metadata::Deprecated(message,\
+                                      ::Windows::Foundation::Metadata::DeprecationType::Deprecate, 0x0)
 
 namespace CxCli {
 
@@ -88,8 +97,11 @@ inline String^ string_from_unmanaged(const std::string &from) {
 
 #elif TD_CLI
 
+#undef small
+
 #define REF_NEW gcnew
 #define CLRCALL __clrcall
+#define DEPRECATED_ATTRIBUTE(message) System::ObsoleteAttribute(message)
 
 namespace CxCli {
 

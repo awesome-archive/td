@@ -1,23 +1,29 @@
 //
-// Copyright Aliaksei Levin (levlam@telegram.org), Arseny Smirnov (arseny30@gmail.com) 2014-2018
+// Copyright Aliaksei Levin (levlam@telegram.org), Arseny Smirnov (arseny30@gmail.com) 2014-2020
 //
 // Distributed under the Boost Software License, Version 1.0. (See accompanying
 // file LICENSE_1_0.txt or copy at http://www.boost.org/LICENSE_1_0.txt)
 //
 #include "td/utils/crypto.h"
 
+#include "td/utils/as.h"
 #include "td/utils/BigNum.h"
+#include "td/utils/common.h"
 #include "td/utils/logging.h"
 #include "td/utils/misc.h"
 #include "td/utils/port/RwMutex.h"
 #include "td/utils/port/thread_local.h"
 #include "td/utils/Random.h"
 #include "td/utils/ScopeGuard.h"
+#include "td/utils/SharedSlice.h"
+#include "td/utils/StackAllocator.h"
+#include "td/utils/StringBuilder.h"
 
 #if TD_HAVE_OPENSSL
 #include <openssl/aes.h>
 #include <openssl/bio.h>
 #include <openssl/crypto.h>
+#include <openssl/err.h>
 #include <openssl/evp.h>
 #include <openssl/hmac.h>
 #include <openssl/md5.h>
@@ -30,7 +36,12 @@
 #include <zlib.h>
 #endif
 
+#if TD_HAVE_CRC32C
+#include "crc32c/crc32c.h"
+#endif
+
 #include <algorithm>
+#include <cerrno>
 #include <cstring>
 #include <mutex>
 #include <utility>
@@ -128,31 +139,29 @@ uint64 pq_factorize(uint64 pq) {
 void init_crypto() {
   static bool is_inited = [] {
 #if OPENSSL_VERSION_NUMBER >= 0x10100000L
-    return OPENSSL_init_crypto(0, nullptr) != 0;
+    bool result = OPENSSL_init_crypto(0, nullptr) != 0;
 #else
     OpenSSL_add_all_algorithms();
-    return true;
+    bool result = true;
 #endif
+    clear_openssl_errors("Init crypto");
+    return result;
   }();
   CHECK(is_inited);
 }
 
 template <class FromT>
 static string as_big_endian_string(const FromT &from) {
-  size_t size = sizeof(from);
-  string res(size, '\0');
+  char res[sizeof(FromT)];
+  as<FromT>(res) = from;
 
-  auto ptr = reinterpret_cast<const unsigned char *>(&from);
-  std::memcpy(&res[0], ptr, size);
-
-  size_t i = size;
+  size_t i = sizeof(FromT);
   while (i && res[i - 1] == 0) {
     i--;
   }
 
-  res.resize(i);
-  std::reverse(res.begin(), res.end());
-  return res;
+  std::reverse(res, res + i);
+  return string(res, res + i);
 }
 
 static int pq_factorize_big(Slice pq_str, string *p_str, string *q_str) {
@@ -241,89 +250,188 @@ int pq_factorize(Slice pq_str, string *p_str, string *q_str) {
   return 0;
 }
 
-static void aes_ige_xcrypt(const UInt256 &aes_key, UInt256 *aes_iv, Slice from, MutableSlice to, bool encrypt_flag) {
+class AesState::Impl {
+ public:
+  EVP_CIPHER_CTX *ctx{nullptr};
+  bool encrypt;
+
+  Impl() = default;
+  Impl(const Impl &from) = delete;
+  Impl &operator=(const Impl &from) = delete;
+  Impl(Impl &&from) = delete;
+  Impl &operator=(Impl &&from) = delete;
+  ~Impl() {
+    if (ctx != nullptr) {
+      EVP_CIPHER_CTX_free(ctx);
+    }
+  }
+};
+
+AesState::AesState() = default;
+AesState::~AesState() = default;
+
+void AesState::init(Slice key, bool encrypt) {
+  CHECK(key.size() == 32);
+  impl_ = make_unique<Impl>();
+  impl_->ctx = EVP_CIPHER_CTX_new();
+  CHECK(impl_->ctx);
+
+  if (encrypt) {
+    int res = EVP_EncryptInit_ex(impl_->ctx, EVP_aes_256_ecb(), nullptr, key.ubegin(), nullptr);
+    LOG_IF(FATAL, res != 1);
+  } else {
+    int res = EVP_DecryptInit_ex(impl_->ctx, EVP_aes_256_ecb(), nullptr, key.ubegin(), nullptr);
+    LOG_IF(FATAL, res != 1);
+  }
+  EVP_CIPHER_CTX_set_padding(impl_->ctx, 0);
+  impl_->encrypt = encrypt;
+}
+
+void AesState::encrypt(const uint8 *src, uint8 *dst, int size) {
+  CHECK(impl_ != nullptr);
+  CHECK(impl_->encrypt);
+  CHECK(impl_->ctx != nullptr);
+  CHECK(size % 16 == 0);
+  int len;
+  int res = EVP_EncryptUpdate(impl_->ctx, dst, &len, src, size);
+  LOG_IF(FATAL, res != 1);
+  CHECK(len == size);
+}
+
+void AesState::decrypt(const uint8 *src, uint8 *dst, int size) {
+  CHECK(impl_ != nullptr);
+  CHECK(!impl_->encrypt);
+  CHECK(impl_->ctx != nullptr);
+  CHECK(size % 16 == 0);
+  int len;
+  int res = EVP_DecryptUpdate(impl_->ctx, dst, &len, src, size);
+  LOG_IF(FATAL, res != 1);
+  CHECK(len == size);
+}
+
+static void aes_ige_xcrypt(Slice aes_key, MutableSlice aes_iv, Slice from, MutableSlice to, bool encrypt_flag) {
+  CHECK(aes_key.size() == 32);
+  CHECK(aes_iv.size() == 32);
   AES_KEY key;
   int err;
   if (encrypt_flag) {
-    err = AES_set_encrypt_key(aes_key.raw, 256, &key);
+    err = AES_set_encrypt_key(aes_key.ubegin(), 256, &key);
   } else {
-    err = AES_set_decrypt_key(aes_key.raw, 256, &key);
+    err = AES_set_decrypt_key(aes_key.ubegin(), 256, &key);
   }
   LOG_IF(FATAL, err != 0);
   CHECK(from.size() <= to.size());
-  AES_ige_encrypt(from.ubegin(), to.ubegin(), from.size(), &key, aes_iv->raw, encrypt_flag);
+  AES_ige_encrypt(from.ubegin(), to.ubegin(), from.size(), &key, aes_iv.ubegin(), encrypt_flag);
 }
 
-void aes_ige_encrypt(const UInt256 &aes_key, UInt256 *aes_iv, Slice from, MutableSlice to) {
+void aes_ige_encrypt(Slice aes_key, MutableSlice aes_iv, Slice from, MutableSlice to) {
   aes_ige_xcrypt(aes_key, aes_iv, from, to, true);
 }
 
-void aes_ige_decrypt(const UInt256 &aes_key, UInt256 *aes_iv, Slice from, MutableSlice to) {
+void aes_ige_decrypt(Slice aes_key, MutableSlice aes_iv, Slice from, MutableSlice to) {
   aes_ige_xcrypt(aes_key, aes_iv, from, to, false);
 }
 
-static void aes_cbc_xcrypt(const UInt256 &aes_key, UInt128 *aes_iv, Slice from, MutableSlice to, bool encrypt_flag) {
+static void aes_cbc_xcrypt(Slice aes_key, MutableSlice aes_iv, Slice from, MutableSlice to, bool encrypt_flag) {
+  CHECK(aes_key.size() == 32);
+  CHECK(aes_iv.size() == 16);
   AES_KEY key;
   int err;
   if (encrypt_flag) {
-    err = AES_set_encrypt_key(aes_key.raw, 256, &key);
+    err = AES_set_encrypt_key(aes_key.ubegin(), 256, &key);
   } else {
-    err = AES_set_decrypt_key(aes_key.raw, 256, &key);
+    err = AES_set_decrypt_key(aes_key.ubegin(), 256, &key);
   }
   LOG_IF(FATAL, err != 0);
   CHECK(from.size() <= to.size());
-  AES_cbc_encrypt(from.ubegin(), to.ubegin(), from.size(), &key, aes_iv->raw, encrypt_flag);
+  AES_cbc_encrypt(from.ubegin(), to.ubegin(), from.size(), &key, aes_iv.ubegin(), encrypt_flag);
 }
 
-void aes_cbc_encrypt(const UInt256 &aes_key, UInt128 *aes_iv, Slice from, MutableSlice to) {
+void aes_cbc_encrypt(Slice aes_key, MutableSlice aes_iv, Slice from, MutableSlice to) {
   aes_cbc_xcrypt(aes_key, aes_iv, from, to, true);
 }
 
-void aes_cbc_decrypt(const UInt256 &aes_key, UInt128 *aes_iv, Slice from, MutableSlice to) {
+void aes_cbc_decrypt(Slice aes_key, MutableSlice aes_iv, Slice from, MutableSlice to) {
   aes_cbc_xcrypt(aes_key, aes_iv, from, to, false);
 }
 
-AesCbcState::AesCbcState(const UInt256 &key, const UInt128 &iv) : key_(key), iv_(iv) {
+AesCbcState::AesCbcState(Slice key256, Slice iv128) : key_(key256), iv_(iv128) {
+  CHECK(key_.size() == 32);
+  CHECK(iv_.size() == 16);
 }
 
 void AesCbcState::encrypt(Slice from, MutableSlice to) {
-  ::td::aes_cbc_encrypt(key_, &iv_, from, to);
+  ::td::aes_cbc_encrypt(key_.as_slice(), iv_.as_mutable_slice(), from, to);
 }
 void AesCbcState::decrypt(Slice from, MutableSlice to) {
-  ::td::aes_cbc_decrypt(key_, &iv_, from, to);
+  ::td::aes_cbc_decrypt(key_.as_slice(), iv_.as_mutable_slice(), from, to);
 }
 
 class AesCtrState::Impl {
  public:
-  Impl(const UInt256 &key, const UInt128 &iv) {
-    if (AES_set_encrypt_key(key.raw, 256, &aes_key) < 0) {
-      LOG(FATAL) << "Failed to set encrypt key";
-    }
-    MutableSlice(counter, AES_BLOCK_SIZE).copy_from({iv.raw, AES_BLOCK_SIZE});
-    current_pos = 0;
+  Impl(Slice key, Slice iv) {
+    CHECK(key.size() == 32);
+    CHECK(iv.size() == 16);
+    static_assert(AES_BLOCK_SIZE == 16, "");
+    aes_state.init(key, true);
+    counter.as_mutable_slice().copy_from(iv);
+    fill();
   }
 
   void encrypt(Slice from, MutableSlice to) {
-    CHECK(to.size() >= from.size());
-    for (size_t i = 0; i < from.size(); i++) {
-      if (current_pos == 0) {
-        AES_encrypt(counter, encrypted_counter, &aes_key);
-        for (int j = 15; j >= 0; j--) {
-          if (++counter[j] != 0) {
-            break;
-          }
+    auto *src = from.ubegin();
+    auto *dst = to.ubegin();
+    auto n = from.size();
+    while (n != 0) {
+      if (current.empty()) {
+        if (BLOCK_COUNT != 1) {
+          counter.as_mutable_slice().copy_from(counter.as_slice().substr((BLOCK_COUNT - 1) * AES_BLOCK_SIZE));
         }
+        inc(counter.as_mutable_slice().ubegin());
+        fill();
       }
-      to[i] = static_cast<char>(from[i] ^ encrypted_counter[current_pos]);
-      current_pos = (current_pos + 1) & 15;
+      size_t min_n = td::min(n, current.size());
+      auto curr = current.ubegin();
+      for (size_t i = 0; i < min_n; i++) {
+        dst[i] = src[i] ^ curr[i];
+      }
+      n -= min_n;
+      src += min_n;
+      dst += min_n;
+      current.remove_prefix(min_n);
     }
   }
 
  private:
-  AES_KEY aes_key;
-  uint8 counter[AES_BLOCK_SIZE];
-  uint8 encrypted_counter[AES_BLOCK_SIZE];
-  uint8 current_pos;
+  AesState aes_state;
+
+  static constexpr size_t BLOCK_COUNT = 32;
+  SecureString counter{AES_BLOCK_SIZE * BLOCK_COUNT};
+  SecureString encrypted_counter{AES_BLOCK_SIZE * BLOCK_COUNT};
+  Slice current;
+
+  void inc(uint8 *ptr) {
+    for (int j = 15; j >= 0; j--) {
+      if (++ptr[j] != 0) {
+        break;
+      }
+    }
+  }
+
+  void fill() {
+    auto *src = counter.as_slice().ubegin();
+    auto *dst = counter.as_mutable_slice().ubegin() + AES_BLOCK_SIZE;
+    for (size_t i = 0; i + 1 < BLOCK_COUNT; i++) {
+      std::memcpy(dst, src, AES_BLOCK_SIZE);
+      inc(dst);
+      src += AES_BLOCK_SIZE;
+      dst += AES_BLOCK_SIZE;
+    }
+
+    aes_state.encrypt(counter.as_slice().ubegin(), encrypted_counter.as_mutable_slice().ubegin(),
+                      static_cast<int>(counter.size()));
+    current = encrypted_counter.as_slice();
+  }
 };
 
 AesCtrState::AesCtrState() = default;
@@ -331,8 +439,8 @@ AesCtrState::AesCtrState(AesCtrState &&from) = default;
 AesCtrState &AesCtrState::operator=(AesCtrState &&from) = default;
 AesCtrState::~AesCtrState() = default;
 
-void AesCtrState::init(const UInt256 &key, const UInt128 &iv) {
-  ctx_ = std::make_unique<AesCtrState::Impl>(key, iv);
+void AesCtrState::init(Slice key, Slice iv) {
+  ctx_ = make_unique<AesCtrState::Impl>(key, iv);
 }
 
 void AesCtrState::encrypt(Slice from, MutableSlice to) {
@@ -372,33 +480,62 @@ string sha512(Slice data) {
   return result;
 }
 
-struct Sha256StateImpl {
-  SHA256_CTX ctx;
+class Sha256State::Impl {
+ public:
+  SHA256_CTX ctx_;
 };
 
 Sha256State::Sha256State() = default;
-Sha256State::Sha256State(Sha256State &&from) = default;
-Sha256State &Sha256State::operator=(Sha256State &&from) = default;
-Sha256State::~Sha256State() = default;
 
-void sha256_init(Sha256State *state) {
-  state->impl = std::make_unique<Sha256StateImpl>();
-  int err = SHA256_Init(&state->impl->ctx);
+Sha256State::Sha256State(Sha256State &&other) {
+  impl_ = std::move(other.impl_);
+  is_inited_ = other.is_inited_;
+  other.is_inited_ = false;
+}
+
+Sha256State &Sha256State::operator=(Sha256State &&other) {
+  Sha256State copy(std::move(other));
+  using std::swap;
+  swap(impl_, copy.impl_);
+  swap(is_inited_, copy.is_inited_);
+  return *this;
+}
+
+Sha256State::~Sha256State() {
+  if (is_inited_) {
+    char result[32];
+    extract(MutableSlice{result, 32});
+    CHECK(!is_inited_);
+  }
+}
+
+void Sha256State::init() {
+  if (!impl_) {
+    impl_ = make_unique<Sha256State::Impl>();
+  }
+  CHECK(!is_inited_);
+  int err = SHA256_Init(&impl_->ctx_);
+  LOG_IF(FATAL, err != 1);
+  is_inited_ = true;
+}
+
+void Sha256State::feed(Slice data) {
+  CHECK(impl_);
+  CHECK(is_inited_);
+  int err = SHA256_Update(&impl_->ctx_, data.ubegin(), data.size());
   LOG_IF(FATAL, err != 1);
 }
 
-void sha256_update(Slice data, Sha256State *state) {
-  CHECK(state->impl);
-  int err = SHA256_Update(&state->impl->ctx, data.ubegin(), data.size());
-  LOG_IF(FATAL, err != 1);
-}
-
-void sha256_final(Sha256State *state, MutableSlice output) {
+void Sha256State::extract(MutableSlice output, bool destroy) {
   CHECK(output.size() >= 32);
-  CHECK(state->impl);
-  int err = SHA256_Final(output.ubegin(), &state->impl->ctx);
+  CHECK(impl_);
+  CHECK(is_inited_);
+  int err = SHA256_Final(output.ubegin(), &impl_->ctx_);
   LOG_IF(FATAL, err != 1);
-  state->impl.reset();
+  is_inited_ = false;
+  if (destroy) {
+    impl_.reset();
+  }
 }
 
 void md5(Slice input, MutableSlice output) {
@@ -456,6 +593,15 @@ void hmac_sha256(Slice key, Slice message, MutableSlice dest) {
   CHECK(dest.size() == 256 / 8);
   unsigned int len = 0;
   auto result = HMAC(EVP_sha256(), key.ubegin(), narrow_cast<int>(key.size()), message.ubegin(),
+                     narrow_cast<int>(message.size()), dest.ubegin(), &len);
+  CHECK(result == dest.ubegin());
+  CHECK(len == dest.size());
+}
+
+void hmac_sha512(Slice key, Slice message, MutableSlice dest) {
+  CHECK(dest.size() == 512 / 8);
+  unsigned int len = 0;
+  auto result = HMAC(EVP_sha512(), key.ubegin(), narrow_cast<int>(key.size()), message.ubegin(),
                      narrow_cast<int>(message.size()), dest.ubegin(), &len);
   CHECK(result == dest.ubegin());
   CHECK(len == dest.size());
@@ -622,12 +768,103 @@ void init_openssl_threads() {
   }
 #endif
 }
+
+Status create_openssl_error(int code, Slice message) {
+  const int max_result_size = 1 << 12;
+  auto result = StackAllocator::alloc(max_result_size);
+  StringBuilder sb(result.as_slice());
+
+  sb << message;
+  while (unsigned long error_code = ERR_get_error()) {
+    char error_buf[1024];
+    ERR_error_string_n(error_code, error_buf, sizeof(error_buf));
+    Slice error(error_buf, std::strlen(error_buf));
+    sb << "{" << error << "}";
+  }
+  LOG_IF(ERROR, sb.is_error()) << "OpenSSL error buffer overflow";
+  LOG(DEBUG) << sb.as_cslice();
+  return Status::Error(code, sb.as_cslice());
+}
+
+void clear_openssl_errors(Slice source) {
+  if (ERR_peek_error() != 0) {
+    LOG(ERROR) << source << ": " << create_openssl_error(0, "Unprocessed OPENSSL_ERROR");
+  }
+#if TD_PORT_WINDOWS
+  WSASetLastError(0);
+#else
+  errno = 0;
+#endif
+}
+
 #endif
 
 #if TD_HAVE_ZLIB
 uint32 crc32(Slice data) {
   return static_cast<uint32>(::crc32(0, data.ubegin(), static_cast<uint32>(data.size())));
 }
+#endif
+
+#if TD_HAVE_CRC32C
+uint32 crc32c(Slice data) {
+  return crc32c::Crc32c(data.data(), data.size());
+}
+
+uint32 crc32c_extend(uint32 old_crc, Slice data) {
+  return crc32c::Extend(old_crc, data.ubegin(), data.size());
+}
+
+namespace {
+
+uint32 gf32_matrix_times(const uint32 *matrix, uint32 vector) {
+  uint32 sum = 0;
+  while (vector) {
+    if (vector & 1) {
+      sum ^= *matrix;
+    }
+    vector >>= 1;
+    matrix++;
+  }
+  return sum;
+}
+
+void gf32_matrix_square(uint32 *square, const uint32 *matrix) {
+  for (int n = 0; n < 32; n++) {
+    square[n] = gf32_matrix_times(matrix, matrix[n]);
+  }
+}
+
+}  // namespace
+
+uint32 crc32c_extend(uint32 old_crc, uint32 data_crc, size_t data_size) {
+  static uint32 power_buf_raw[1024];
+  static const uint32 *power_buf = [&] {
+    auto *buf = power_buf_raw;
+    buf[0] = 0x82F63B78u;
+    for (int n = 0; n < 31; n++) {
+      buf[n + 1] = 1u << n;
+    }
+    for (int n = 1; n < 32; n++) {
+      gf32_matrix_square(buf + (n << 5), buf + ((n - 1) << 5));
+    }
+    return buf;
+  }();
+
+  if (data_size == 0) {
+    return old_crc;
+  }
+
+  const uint32 *p = power_buf + 64;
+  do {
+    p += 32;
+    if (data_size & 1) {
+      old_crc = gf32_matrix_times(p, old_crc);
+    }
+    data_size >>= 1;
+  } while (data_size != 0);
+  return old_crc ^ data_crc;
+}
+
 #endif
 
 static const uint64 crc64_table[256] = {
@@ -694,6 +931,36 @@ static uint64 crc64_partial(Slice data, uint64 crc) {
 
 uint64 crc64(Slice data) {
   return crc64_partial(data, static_cast<uint64>(-1)) ^ static_cast<uint64>(-1);
+}
+
+static const uint16 crc16_table[256] = {
+    0x0000, 0x1021, 0x2042, 0x3063, 0x4084, 0x50a5, 0x60c6, 0x70e7, 0x8108, 0x9129, 0xa14a, 0xb16b, 0xc18c, 0xd1ad,
+    0xe1ce, 0xf1ef, 0x1231, 0x0210, 0x3273, 0x2252, 0x52b5, 0x4294, 0x72f7, 0x62d6, 0x9339, 0x8318, 0xb37b, 0xa35a,
+    0xd3bd, 0xc39c, 0xf3ff, 0xe3de, 0x2462, 0x3443, 0x0420, 0x1401, 0x64e6, 0x74c7, 0x44a4, 0x5485, 0xa56a, 0xb54b,
+    0x8528, 0x9509, 0xe5ee, 0xf5cf, 0xc5ac, 0xd58d, 0x3653, 0x2672, 0x1611, 0x0630, 0x76d7, 0x66f6, 0x5695, 0x46b4,
+    0xb75b, 0xa77a, 0x9719, 0x8738, 0xf7df, 0xe7fe, 0xd79d, 0xc7bc, 0x48c4, 0x58e5, 0x6886, 0x78a7, 0x0840, 0x1861,
+    0x2802, 0x3823, 0xc9cc, 0xd9ed, 0xe98e, 0xf9af, 0x8948, 0x9969, 0xa90a, 0xb92b, 0x5af5, 0x4ad4, 0x7ab7, 0x6a96,
+    0x1a71, 0x0a50, 0x3a33, 0x2a12, 0xdbfd, 0xcbdc, 0xfbbf, 0xeb9e, 0x9b79, 0x8b58, 0xbb3b, 0xab1a, 0x6ca6, 0x7c87,
+    0x4ce4, 0x5cc5, 0x2c22, 0x3c03, 0x0c60, 0x1c41, 0xedae, 0xfd8f, 0xcdec, 0xddcd, 0xad2a, 0xbd0b, 0x8d68, 0x9d49,
+    0x7e97, 0x6eb6, 0x5ed5, 0x4ef4, 0x3e13, 0x2e32, 0x1e51, 0x0e70, 0xff9f, 0xefbe, 0xdfdd, 0xcffc, 0xbf1b, 0xaf3a,
+    0x9f59, 0x8f78, 0x9188, 0x81a9, 0xb1ca, 0xa1eb, 0xd10c, 0xc12d, 0xf14e, 0xe16f, 0x1080, 0x00a1, 0x30c2, 0x20e3,
+    0x5004, 0x4025, 0x7046, 0x6067, 0x83b9, 0x9398, 0xa3fb, 0xb3da, 0xc33d, 0xd31c, 0xe37f, 0xf35e, 0x02b1, 0x1290,
+    0x22f3, 0x32d2, 0x4235, 0x5214, 0x6277, 0x7256, 0xb5ea, 0xa5cb, 0x95a8, 0x8589, 0xf56e, 0xe54f, 0xd52c, 0xc50d,
+    0x34e2, 0x24c3, 0x14a0, 0x0481, 0x7466, 0x6447, 0x5424, 0x4405, 0xa7db, 0xb7fa, 0x8799, 0x97b8, 0xe75f, 0xf77e,
+    0xc71d, 0xd73c, 0x26d3, 0x36f2, 0x0691, 0x16b0, 0x6657, 0x7676, 0x4615, 0x5634, 0xd94c, 0xc96d, 0xf90e, 0xe92f,
+    0x99c8, 0x89e9, 0xb98a, 0xa9ab, 0x5844, 0x4865, 0x7806, 0x6827, 0x18c0, 0x08e1, 0x3882, 0x28a3, 0xcb7d, 0xdb5c,
+    0xeb3f, 0xfb1e, 0x8bf9, 0x9bd8, 0xabbb, 0xbb9a, 0x4a75, 0x5a54, 0x6a37, 0x7a16, 0x0af1, 0x1ad0, 0x2ab3, 0x3a92,
+    0xfd2e, 0xed0f, 0xdd6c, 0xcd4d, 0xbdaa, 0xad8b, 0x9de8, 0x8dc9, 0x7c26, 0x6c07, 0x5c64, 0x4c45, 0x3ca2, 0x2c83,
+    0x1ce0, 0x0cc1, 0xef1f, 0xff3e, 0xcf5d, 0xdf7c, 0xaf9b, 0xbfba, 0x8fd9, 0x9ff8, 0x6e17, 0x7e36, 0x4e55, 0x5e74,
+    0x2e93, 0x3eb2, 0x0ed1, 0x1ef0};
+
+uint16 crc16(Slice data) {
+  uint32 crc = 0;
+  for (auto c : data) {
+    auto t = (static_cast<unsigned char>(c) ^ (crc >> 8)) & 0xff;
+    crc = crc16_table[t] ^ (crc << 8);
+  }
+  return static_cast<uint16>(crc);
 }
 
 }  // namespace td
