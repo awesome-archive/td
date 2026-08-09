@@ -1,5 +1,5 @@
 //
-// Copyright Aliaksei Levin (levlam@telegram.org), Arseny Smirnov (arseny30@gmail.com) 2014-2018
+// Copyright Aliaksei Levin (levlam@telegram.org), Arseny Smirnov (arseny30@gmail.com) 2014-2026
 //
 // Distributed under the Boost Software License, Version 1.0. (See accompanying
 // file LICENSE_1_0.txt or copy at http://www.boost.org/LICENSE_1_0.txt)
@@ -42,6 +42,25 @@ void DelayDispatcher::loop() {
   }
 
   set_timeout_at(wakeup_at_.at());
+}
+
+void DelayDispatcher::close_silent() {
+  while (!queue_.empty()) {
+    auto query = std::move(queue_.front());
+    queue_.pop();
+    query.net_query->clear();
+  }
+  stop();
+}
+
+void DelayDispatcher::tear_down() {
+  while (!queue_.empty()) {
+    auto query = std::move(queue_.front());
+    queue_.pop();
+    query.net_query->set_error(Global::request_aborted_error());
+    send_closure(std::move(query.callback), &NetQueryCallback::on_result, std::move(query.net_query));
+  }
+  parent_.reset();
 }
 
 }  // namespace td

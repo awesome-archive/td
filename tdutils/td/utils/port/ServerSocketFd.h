@@ -1,32 +1,48 @@
 //
-// Copyright Aliaksei Levin (levlam@telegram.org), Arseny Smirnov (arseny30@gmail.com) 2014-2018
+// Copyright Aliaksei Levin (levlam@telegram.org), Arseny Smirnov (arseny30@gmail.com) 2014-2026
 //
 // Distributed under the Boost Software License, Version 1.0. (See accompanying
 // file LICENSE_1_0.txt or copy at http://www.boost.org/LICENSE_1_0.txt)
 //
 #pragma once
 
-#include "td/utils/port/Fd.h"
+#include "td/utils/port/detail/NativeFd.h"
+#include "td/utils/port/detail/PollableFd.h"
+#include "td/utils/port/platform.h"
 #include "td/utils/port/SocketFd.h"
 
 #include "td/utils/Slice.h"
 #include "td/utils/Status.h"
 
+#include <memory>
+
 namespace td {
+
+namespace detail {
+class ServerSocketFdImpl;
+class ServerSocketFdImplDeleter {
+ public:
+  void operator()(ServerSocketFdImpl *impl);
+};
+}  // namespace detail
 
 class ServerSocketFd {
  public:
-  ServerSocketFd() = default;
+  ServerSocketFd();
   ServerSocketFd(const ServerSocketFd &) = delete;
   ServerSocketFd &operator=(const ServerSocketFd &) = delete;
-  ServerSocketFd(ServerSocketFd &&) = default;
-  ServerSocketFd &operator=(ServerSocketFd &&) = default;
+  ServerSocketFd(ServerSocketFd &&) noexcept;
+  ServerSocketFd &operator=(ServerSocketFd &&) noexcept;
+  ~ServerSocketFd();
+
+  Result<uint32> maximize_snd_buffer(uint32 max_size = 0);
+  Result<uint32> maximize_rcv_buffer(uint32 max_size = 0);
 
   static Result<ServerSocketFd> open(int32 port, CSlice addr = CSlice("0.0.0.0")) TD_WARN_UNUSED_RESULT;
 
-  const Fd &get_fd() const;
-  Fd &get_fd();
-  int32 get_flags() const;
+  PollableFdInfo &get_poll_info();
+  const PollableFdInfo &get_poll_info() const;
+
   Status get_pending_error() TD_WARN_UNUSED_RESULT;
 
   Result<SocketFd> accept() TD_WARN_UNUSED_RESULT;
@@ -34,10 +50,11 @@ class ServerSocketFd {
   void close();
   bool empty() const;
 
- private:
-  Fd fd_;
+  const NativeFd &get_native_fd() const;
 
-  Status init(int32 port, CSlice addr) TD_WARN_UNUSED_RESULT;
+ private:
+  std::unique_ptr<detail::ServerSocketFdImpl, detail::ServerSocketFdImplDeleter> impl_;
+  explicit ServerSocketFd(unique_ptr<detail::ServerSocketFdImpl> impl);
 };
 
 }  // namespace td

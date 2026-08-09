@@ -1,12 +1,12 @@
 //
-// Copyright Aliaksei Levin (levlam@telegram.org), Arseny Smirnov (arseny30@gmail.com) 2014-2018
+// Copyright Aliaksei Levin (levlam@telegram.org), Arseny Smirnov (arseny30@gmail.com) 2014-2026
 //
 // Distributed under the Boost Software License, Version 1.0. (See accompanying
 // file LICENSE_1_0.txt or copy at http://www.boost.org/LICENSE_1_0.txt)
 //
 #pragma once
 
-#include "td/utils/logging.h"
+#include "td/utils/common.h"
 #include "td/utils/StringBuilder.h"
 
 #include <tuple>
@@ -17,8 +17,10 @@ class DcId {
  public:
   DcId() = default;
 
+  static constexpr int32 MAX_RAW_DC_ID = 1000;
+
   static bool is_valid(int32 dc_id) {
-    return 1 <= dc_id && dc_id <= 1000;
+    return 1 <= dc_id && dc_id <= MAX_RAW_DC_ID;
   }
   static DcId main() {
     return DcId{MainDc, false};
@@ -39,6 +41,13 @@ class DcId {
   }
   static DcId from_value(int32 value) {
     return DcId{value, false};
+  }
+  static DcId create(int32 dc_id_value) {
+    if (DcId::is_valid(dc_id_value)) {
+      return DcId(dc_id_value, false);
+    } else {
+      return DcId::invalid();
+    }
   }
 
   bool is_empty() const {
@@ -88,8 +97,12 @@ class DcId {
 
 inline StringBuilder &operator<<(StringBuilder &sb, const DcId &dc_id) {
   sb << "DcId{";
-  if (dc_id.is_empty()) {
+  if (dc_id == DcId::invalid()) {
+    sb << "invalid";
+  } else if (dc_id == DcId()) {
     sb << "empty";
+  } else if (dc_id.is_empty()) {
+    sb << "is_empty";
   } else if (dc_id.is_main()) {
     sb << "main";
   } else {

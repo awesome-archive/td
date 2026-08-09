@@ -1,5 +1,5 @@
 //
-// Copyright Aliaksei Levin (levlam@telegram.org), Arseny Smirnov (arseny30@gmail.com) 2014-2018
+// Copyright Aliaksei Levin (levlam@telegram.org), Arseny Smirnov (arseny30@gmail.com) 2014-2026
 //
 // Distributed under the Boost Software License, Version 1.0. (See accompanying
 // file LICENSE_1_0.txt or copy at http://www.boost.org/LICENSE_1_0.txt)
@@ -15,7 +15,7 @@
 #include <utility>
 #include <vector>
 
-std::pair<std::string, std::string> split(std::string s, char delimiter = ' ') {
+static std::pair<std::string, std::string> split(std::string s, char delimiter = ' ') {
   auto delimiter_pos = s.find(delimiter);
   if (delimiter_pos == std::string::npos) {
     return {std::move(s), ""};
@@ -26,8 +26,8 @@ std::pair<std::string, std::string> split(std::string s, char delimiter = ' ') {
   }
 }
 
-bool generate(const char *file_name, const char *from_name, const char *to_name,
-              const std::map<std::string, std::string> &map) {
+static bool generate(const char *file_name, const char *from_name, const char *to_name,
+                     const std::map<std::string, std::string> &map) {
   // binary mode is needed for MSYS2 gperf
   std::ofstream out(file_name, std::ios_base::trunc | std::ios_base::binary);
   if (!out) {
@@ -71,6 +71,10 @@ bool generate(const char *file_name, const char *from_name, const char *to_name,
   return true;
 }
 
+static bool is_private_mime_type(const std::string &mime_type) {
+  return mime_type.find("/x-") != std::string::npos;
+}
+
 int main(int argc, char *argv[]) {
   if (argc != 4) {
     std::cerr << "Wrong number of arguments supplied. Expected 'generate_mime_types_gperf <mime_types.txt> "
@@ -112,27 +116,33 @@ int main(int argc, char *argv[]) {
 
     std::vector<std::string> extensions;
     while (!extensions_string.empty()) {
-      extensions.push_back("");
+      extensions.emplace_back();
       std::tie(extensions.back(), extensions_string) = split(extensions_string);
     }
     assert(!extensions.empty());
 
-    std::map<std::string, std::string> preffered_extensions{{"image/jpeg", "jpg"},  {"audio/mpeg", "mp3"},
+    std::map<std::string, std::string> preferred_extensions{{"image/jpeg", "jpg"},  {"audio/mpeg", "mp3"},
                                                             {"audio/midi", "midi"}, {"text/x-pascal", "pas"},
                                                             {"text/x-asm", "asm"},  {"video/quicktime", "mov"}};
     std::size_t index = 0;
-    if (preffered_extensions.count(mime_type) != 0) {
-      index = std::find(extensions.begin(), extensions.end(), preffered_extensions[mime_type]) - extensions.begin();
+    if (preferred_extensions.count(mime_type) != 0) {
+      index = std::find(extensions.begin(), extensions.end(), preferred_extensions[mime_type]) - extensions.begin();
       assert(index < extensions.size());
     }
     if (mime_type_to_extension.emplace_hint(mime_type_to_extension.end(), mime_type, extensions[index])->second !=
         extensions[index]) {
-      std::cerr << "MIME type \"" << mime_type << "\" has more than one extensions list" << std::endl;
+      std::cerr << "MIME type \"" << mime_type << "\" has more than one list of extensions" << std::endl;
     }
 
     for (auto &extension : extensions) {
       if (!extension_to_mime_type.emplace(extension, mime_type).second) {
-        std::cerr << "Extension \"" << extension << "\" matches more than one type" << std::endl;
+        if (is_private_mime_type(extension_to_mime_type[extension]) == is_private_mime_type(mime_type)) {
+          std::cerr << "Extension \"" << extension << "\" matches more than one type" << std::endl;
+        } else {
+          if (!is_private_mime_type(mime_type)) {
+            extension_to_mime_type[extension] = mime_type;
+          }
+        }
       }
     }
   }

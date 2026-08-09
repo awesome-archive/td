@@ -1,5 +1,5 @@
 //
-// Copyright Aliaksei Levin (levlam@telegram.org), Arseny Smirnov (arseny30@gmail.com) 2014-2018
+// Copyright Aliaksei Levin (levlam@telegram.org), Arseny Smirnov (arseny30@gmail.com) 2014-2026
 //
 // Distributed under the Boost Software License, Version 1.0. (See accompanying
 // file LICENSE_1_0.txt or copy at http://www.boost.org/LICENSE_1_0.txt)
@@ -7,23 +7,24 @@
 #include "td/telegram/SecureValue.h"
 
 #include "td/telegram/DialogId.h"
+#include "td/telegram/files/FileEncryptionKey.h"
+#include "td/telegram/files/FileLocation.h"
 #include "td/telegram/files/FileManager.h"
+#include "td/telegram/files/FileType.h"
 #include "td/telegram/Global.h"
 #include "td/telegram/misc.h"
 #include "td/telegram/net/DcId.h"
-#include "td/telegram/Payments.h"
-
-#include "td/telegram/td_api.h"
+#include "td/telegram/OrderInfo.h"
 #include "td/telegram/telegram_api.h"
-#include "td/telegram/telegram_api.hpp"
 
+#include "td/utils/algorithm.h"
 #include "td/utils/base64.h"
 #include "td/utils/buffer.h"
 #include "td/utils/crypto.h"
 #include "td/utils/JsonBuilder.h"
 #include "td/utils/logging.h"
 #include "td/utils/misc.h"
-#include "td/utils/overloaded.h"
+#include "td/utils/SliceBuilder.h"
 #include "td/utils/utf8.h"
 
 #include <limits>
@@ -240,10 +241,9 @@ SuitableSecureValue get_suitable_secure_value(
     const tl_object_ptr<telegram_api::secureRequiredType> &secure_required_type) {
   SuitableSecureValue result;
   result.type = get_secure_value_type(secure_required_type->type_);
-  auto flags = secure_required_type->flags_;
-  result.is_selfie_required = (flags & telegram_api::secureRequiredType::SELFIE_REQUIRED_MASK) != 0;
-  result.is_translation_required = (flags & telegram_api::secureRequiredType::TRANSLATION_REQUIRED_MASK) != 0;
-  result.is_native_name_required = (flags & telegram_api::secureRequiredType::NATIVE_NAMES_MASK) != 0;
+  result.is_selfie_required = secure_required_type->selfie_required_;
+  result.is_translation_required = secure_required_type->translation_required_;
+  result.is_native_name_required = secure_required_type->native_names_;
   return result;
 }
 
@@ -353,8 +353,9 @@ EncryptedSecureFile get_encrypted_secure_file(FileManager *file_manager,
         break;
       }
       result.file.file_id = file_manager->register_remote(
-          FullRemoteFileLocation(FileType::Secure, secure_file->id_, secure_file->access_hash_, DcId::internal(dc_id)),
-          FileLocationSource::FromServer, DialogId(), 0, secure_file->size_, PSTRING() << secure_file->id_ << ".jpg");
+          FullRemoteFileLocation(FileType::SecureEncrypted, secure_file->id_, secure_file->access_hash_,
+                                 DcId::internal(dc_id), ""),
+          FileLocationSource::FromServer, DialogId(), secure_file->size_, 0, PSTRING() << secure_file->id_ << ".jpg");
       result.file.date = secure_file->date_;
       if (result.file.date < 0) {
         LOG(ERROR) << "Receive wrong date " << result.file.date;
@@ -390,18 +391,20 @@ telegram_api::object_ptr<telegram_api::InputSecureFile> get_input_secure_file_ob
     LOG(ERROR) << "Receive invalid EncryptedSecureFile";
     return nullptr;
   }
-  CHECK(file_manager->get_file_view(file.file.file_id).file_id() ==
-        file_manager->get_file_view(input_file.file_id).file_id());
+  CHECK(input_file.file_upload_id.get_file_id().is_valid());
+  CHECK(file_manager->get_file_view(file.file.file_id).get_main_file_id() ==
+        file_manager->get_file_view(input_file.file_upload_id.get_file_id()).get_main_file_id());
   auto res = std::move(input_file.input_file);
   if (res == nullptr) {
-    return file_manager->get_file_view(file.file.file_id).remote_location().as_input_secure_file();
+    auto file_view = file_manager->get_file_view(file.file.file_id);
+    const auto *full_remote_location = file_view.get_full_remote_location();
+    CHECK(full_remote_location != nullptr);
+    return full_remote_location->as_input_secure_file();
   }
-  telegram_api::downcast_call(*res, overloaded(
-                                        [&](telegram_api::inputSecureFileUploaded &uploaded) {
-                                          uploaded.secret_ = BufferSlice(file.encrypted_secret);
-                                          uploaded.file_hash_ = BufferSlice(file.file_hash);
-                                        },
-                                        [&](telegram_api::inputSecureFile &) { UNREACHABLE(); }));
+  CHECK(res->get_id() == telegram_api::inputSecureFileUploaded::ID);
+  auto uploaded = static_cast<telegram_api::inputSecureFileUploaded *>(res.get());
+  uploaded->secret_ = BufferSlice(file.encrypted_secret);
+  uploaded->file_hash_ = BufferSlice(file.file_hash);
   return res;
 }
 
@@ -420,15 +423,20 @@ static td_api::object_ptr<td_api::datedFile> get_dated_file_object(FileManager *
   auto file_id = dated_file.file_id;
   CHECK(file_id.is_valid());
   auto file_view = file_manager->get_file_view(file_id);
-  if (!file_view.has_remote_location() || file_view.remote_location().is_web()) {
+  const auto *full_remote_location = file_view.get_full_remote_location();
+  if (full_remote_location == nullptr || full_remote_location->is_web()) {
     LOG(ERROR) << "Have wrong file in get_dated_file_object";
     return nullptr;
   }
+  if (file_view.get_type() != FileType::SecureEncrypted) {
+    LOG(ERROR) << "Have file of a wrong type in get_dated_file_object";
+  } else if (file_view.encryption_key().empty()) {
+    return get_dated_file_object(file_manager, dated_file);
+  }
   dated_file.file_id = file_manager->register_remote(
-      FullRemoteFileLocation(FileType::SecureRaw, file_view.remote_location().get_id(),
-                             file_view.remote_location().get_access_hash(), file_view.remote_location().get_dc_id()),
-      FileLocationSource::FromServer, DialogId(), file_view.size(), file_view.expected_size(),
-      file_view.suggested_name());
+      FullRemoteFileLocation(FileType::SecureDecrypted, full_remote_location->get_id(),
+                             full_remote_location->get_access_hash(), full_remote_location->get_dc_id(), ""),
+      FileLocationSource::FromServer, DialogId(), 0, file_view.expected_size(), file_view.suggested_path());
   return get_dated_file_object(file_manager, dated_file);
 }
 
@@ -509,7 +517,6 @@ static bool check_encrypted_secure_value(const EncryptedSecureValue &value) {
     case SecureValueType::TemporaryRegistration:
       return !has_encrypted_data && !has_plain_data && has_files && !has_front_side && !has_reverse_side && !has_selfie;
     case SecureValueType::PhoneNumber:
-      return has_plain_data && !has_files && !has_front_side && !has_reverse_side && !has_selfie && !has_translations;
     case SecureValueType::EmailAddress:
       return has_plain_data && !has_files && !has_front_side && !has_reverse_side && !has_selfie && !has_translations;
     case SecureValueType::None:
@@ -670,13 +677,6 @@ td_api::object_ptr<td_api::encryptedCredentials> get_encrypted_credentials_objec
                                                            credentials.encrypted_secret);
 }
 
-static string lpad0(string str, size_t size) {
-  if (str.size() >= size) {
-    return str;
-  }
-  return string(size - str.size(), '0') + str;
-}
-
 // TODO tests
 static Status check_date(int32 day, int32 month, int32 year) {
   if (day < 1 || day > 31) {
@@ -713,7 +713,7 @@ static Result<int32> to_int32(Slice str) {
   int32 integer_value = 0;
   for (auto c : str) {
     if (!is_digit(c)) {
-      return Status::Error(PSLICE() << "Can't parse \"" << str << "\" as number");
+      return Status::Error(400, PSLICE() << "Can't parse \"" << utf8_encode(str.str()) << "\" as number");
     }
     integer_value = integer_value * 10 + c - '0';
   }
@@ -724,12 +724,13 @@ static Result<td_api::object_ptr<td_api::date>> get_date_object(Slice date) {
   if (date.empty()) {
     return nullptr;
   }
-  if (date.size() != 10u) {
-    return Status::Error(400, "Date has wrong size");
+  if (date.size() > 10u || date.size() < 8u) {
+    return Status::Error(400, PSLICE() << "Date \"" << utf8_encode(date.str()) << "\" has wrong length");
   }
   auto parts = full_split(date, '.');
-  if (parts.size() != 3 || parts[0].size() != 2 || parts[1].size() != 2 || parts[2].size() != 4) {
-    return Status::Error(400, "Date has wrong parts");
+  if (parts.size() != 3 || parts[0].size() > 2 || parts[1].size() > 2 || parts[2].size() != 4 || parts[0].empty() ||
+      parts[1].empty()) {
+    return Status::Error(400, PSLICE() << "Date \"" << utf8_encode(date.str()) << "\" has wrong parts");
   }
   TRY_RESULT(day, to_int32(parts[0]));
   TRY_RESULT(month, to_int32(parts[1]));
@@ -758,7 +759,7 @@ static Status check_gender(string &gender) {
 
 static Result<string> get_personal_details(td_api::object_ptr<td_api::personalDetails> &&personal_details) {
   if (personal_details == nullptr) {
-    return Status::Error(400, "Personal details must not be empty");
+    return Status::Error(400, "Personal details must be non-empty");
   }
   TRY_STATUS(check_name(personal_details->first_name_));
   TRY_STATUS(check_name(personal_details->middle_name_));
@@ -768,7 +769,7 @@ static Result<string> get_personal_details(td_api::object_ptr<td_api::personalDe
   TRY_STATUS(check_name(personal_details->native_last_name_));
   TRY_RESULT(birthdate, get_date(std::move(personal_details->birthdate_)));
   if (birthdate.empty()) {
-    return Status::Error(400, "Birthdate must not be empty");
+    return Status::Error(400, "Birthdate must be non-empty");
   }
   TRY_STATUS(check_gender(personal_details->gender_));
   TRY_STATUS(check_country_code(personal_details->country_code_));
@@ -797,23 +798,23 @@ static Result<td_api::object_ptr<td_api::personalDetails>> get_personal_details_
 
   auto value = r_value.move_as_ok();
   if (value.type() != JsonValue::Type::Object) {
-    return Status::Error(400, "Personal details should be an Object");
+    return Status::Error(400, "Personal details must be an Object");
   }
 
   auto &object = value.get_object();
-  TRY_RESULT(first_name, get_json_object_string_field(object, "first_name", true));
-  TRY_RESULT(middle_name, get_json_object_string_field(object, "middle_name", true));
-  TRY_RESULT(last_name, get_json_object_string_field(object, "last_name", true));
-  TRY_RESULT(native_first_name, get_json_object_string_field(object, "first_name_native", true));
-  TRY_RESULT(native_middle_name, get_json_object_string_field(object, "middle_name_native", true));
-  TRY_RESULT(native_last_name, get_json_object_string_field(object, "last_name_native", true));
-  TRY_RESULT(birthdate, get_json_object_string_field(object, "birth_date", true));
+  TRY_RESULT(first_name, object.get_optional_string_field("first_name"));
+  TRY_RESULT(middle_name, object.get_optional_string_field("middle_name"));
+  TRY_RESULT(last_name, object.get_optional_string_field("last_name"));
+  TRY_RESULT(native_first_name, object.get_optional_string_field("first_name_native"));
+  TRY_RESULT(native_middle_name, object.get_optional_string_field("middle_name_native"));
+  TRY_RESULT(native_last_name, object.get_optional_string_field("last_name_native"));
+  TRY_RESULT(birthdate, object.get_optional_string_field("birth_date"));
   if (birthdate.empty()) {
-    return Status::Error(400, "Birthdate must not be empty");
+    return Status::Error(400, "Birthdate must be non-empty");
   }
-  TRY_RESULT(gender, get_json_object_string_field(object, "gender", true));
-  TRY_RESULT(country_code, get_json_object_string_field(object, "country_code", true));
-  TRY_RESULT(residence_country_code, get_json_object_string_field(object, "residence_country_code", true));
+  TRY_RESULT(gender, object.get_optional_string_field("gender"));
+  TRY_RESULT(country_code, object.get_optional_string_field("country_code"));
+  TRY_RESULT(residence_country_code, object.get_optional_string_field("residence_country_code"));
 
   TRY_STATUS(check_name(first_name));
   TRY_STATUS(check_name(middle_name));
@@ -837,7 +838,7 @@ static Status check_document_number(string &number) {
     return Status::Error(400, "Document number must be encoded in UTF-8");
   }
   if (number.empty()) {
-    return Status::Error(400, "Document number must not be empty");
+    return Status::Error(400, "Document number must be non-empty");
   }
   if (utf8_length(number) > 24) {
     return Status::Error(400, "Document number is too long");
@@ -847,7 +848,7 @@ static Status check_document_number(string &number) {
 
 static Result<DatedFile> get_secure_file(FileManager *file_manager, td_api::object_ptr<td_api::InputFile> &&file) {
   TRY_RESULT(file_id,
-             file_manager->get_input_file_id(FileType::Secure, std::move(file), DialogId(), false, false, false, true));
+             file_manager->get_input_file_id(FileType::SecureEncrypted, file, DialogId(), false, false, false, true));
   DatedFile result;
   result.file_id = file_id;
   result.date = G()->unix_time();
@@ -868,10 +869,10 @@ static Result<SecureValue> get_identity_document(SecureValueType type, FileManag
                                                  td_api::object_ptr<td_api::inputIdentityDocument> &&identity_document,
                                                  bool need_reverse_side) {
   if (identity_document == nullptr) {
-    return Status::Error(400, "Identity document must not be empty");
+    return Status::Error(400, "Identity document must be non-empty");
   }
   TRY_STATUS(check_document_number(identity_document->number_));
-  TRY_RESULT(date, get_date(std::move(identity_document->expiry_date_)));
+  TRY_RESULT(date, get_date(std::move(identity_document->expiration_date_)));
 
   SecureValue res;
   res.type = type;
@@ -889,23 +890,19 @@ static Result<SecureValue> get_identity_document(SecureValueType type, FileManag
     }
   } else {
     if (!need_reverse_side) {
-      return Status::Error(400, "Document shouldn't have a reverse side");
+      return Status::Error(400, "Document can't have a reverse side");
     }
   }
 
-  TRY_RESULT(front_side, get_secure_file(file_manager, std::move(identity_document->front_side_)));
-  res.front_side = std::move(front_side);
+  TRY_RESULT_ASSIGN(res.front_side, get_secure_file(file_manager, std::move(identity_document->front_side_)));
   if (identity_document->reverse_side_ != nullptr) {
-    TRY_RESULT(reverse_side, get_secure_file(file_manager, std::move(identity_document->reverse_side_)));
-    res.reverse_side = std::move(reverse_side);
+    TRY_RESULT_ASSIGN(res.reverse_side, get_secure_file(file_manager, std::move(identity_document->reverse_side_)));
   }
   if (identity_document->selfie_ != nullptr) {
-    TRY_RESULT(selfie, get_secure_file(file_manager, std::move(identity_document->selfie_)));
-    res.selfie = std::move(selfie);
+    TRY_RESULT_ASSIGN(res.selfie, get_secure_file(file_manager, std::move(identity_document->selfie_)));
   }
   if (!identity_document->translation_.empty()) {
-    TRY_RESULT(translations, get_secure_files(file_manager, std::move(identity_document->translation_)));
-    res.translations = std::move(translations);
+    TRY_RESULT_ASSIGN(res.translations, get_secure_files(file_manager, std::move(identity_document->translation_)));
   }
   return res;
 }
@@ -935,12 +932,12 @@ static Result<td_api::object_ptr<td_api::identityDocument>> get_identity_documen
 
   auto json_value = r_value.move_as_ok();
   if (json_value.type() != JsonValue::Type::Object) {
-    return Status::Error(400, "Identity document should be an Object");
+    return Status::Error(400, "Identity document must be an Object");
   }
 
   auto &object = json_value.get_object();
-  TRY_RESULT(number, get_json_object_string_field(object, "document_no", true));
-  TRY_RESULT(expiry_date, get_json_object_string_field(object, "expiry_date", true));
+  TRY_RESULT(number, object.get_optional_string_field("document_no"));
+  TRY_RESULT(expiry_date, object.get_optional_string_field("expiry_date"));
 
   TRY_STATUS(check_document_number(number));
   TRY_RESULT(date, get_date_object(expiry_date));
@@ -955,7 +952,7 @@ static Result<SecureValue> get_personal_document(
     SecureValueType type, FileManager *file_manager,
     td_api::object_ptr<td_api::inputPersonalDocument> &&personal_document) {
   if (personal_document == nullptr) {
-    return Status::Error(400, "Personal document must not be empty");
+    return Status::Error(400, "Personal document must be non-empty");
   }
 
   SecureValue res;
@@ -963,11 +960,9 @@ static Result<SecureValue> get_personal_document(
   if (personal_document->files_.empty()) {
     return Status::Error(400, "Document's files are required");
   }
-  TRY_RESULT(files, get_secure_files(file_manager, std::move(personal_document->files_)));
-  res.files = std::move(files);
+  TRY_RESULT_ASSIGN(res.files, get_secure_files(file_manager, std::move(personal_document->files_)));
   if (!personal_document->translation_.empty()) {
-    TRY_RESULT(translations, get_secure_files(file_manager, std::move(personal_document->translation_)));
-    res.translations = std::move(translations);
+    TRY_RESULT_ASSIGN(res.translations, get_secure_files(file_manager, std::move(personal_document->translation_)));
   }
   return res;
 }
@@ -995,7 +990,7 @@ static Status check_email_address(string &email_address) {
 Result<SecureValue> get_secure_value(FileManager *file_manager,
                                      td_api::object_ptr<td_api::InputPassportElement> &&input_passport_element) {
   if (input_passport_element == nullptr) {
-    return Status::Error(400, "InputPassportElement must not be empty");
+    return Status::Error(400, "InputPassportElement must be non-empty");
   }
 
   SecureValue res;
@@ -1003,8 +998,7 @@ Result<SecureValue> get_secure_value(FileManager *file_manager,
     case td_api::inputPassportElementPersonalDetails::ID: {
       auto input = td_api::move_object_as<td_api::inputPassportElementPersonalDetails>(input_passport_element);
       res.type = SecureValueType::PersonalDetails;
-      TRY_RESULT(personal_details, get_personal_details(std::move(input->personal_details_)));
-      res.data = std::move(personal_details);
+      TRY_RESULT_ASSIGN(res.data, get_personal_details(std::move(input->personal_details_)));
       break;
     }
     case td_api::inputPassportElementPassport::ID: {
@@ -1202,7 +1196,7 @@ Result<SecureValueWithCredentials> decrypt_secure_value(FileManager *file_manage
   res_credentials.hash = encrypted_secure_value.hash;
   switch (encrypted_secure_value.type) {
     case SecureValueType::None:
-      return Status::Error("Receive invalid Telegram Passport element");
+      return Status::Error(400, "Receive invalid Telegram Passport element");
     case SecureValueType::EmailAddress:
     case SecureValueType::PhoneNumber:
       res.data = encrypted_secure_value.data.data;
@@ -1299,7 +1293,7 @@ static EncryptedSecureFile encrypt_secure_file(FileManager *file_manager, const 
 
 static vector<EncryptedSecureFile> encrypt_secure_files(FileManager *file_manager,
                                                         const secure_storage::Secret &master_secret,
-                                                        vector<DatedFile> files, string &to_hash) {
+                                                        const vector<DatedFile> &files, string &to_hash) {
   return transform(
       files, [&](auto dated_file) { return encrypt_secure_file(file_manager, master_secret, dated_file, to_hash); });
   /*
@@ -1368,26 +1362,22 @@ EncryptedSecureValue encrypt_secure_value(FileManager *file_manager, const secur
   return res;
 }
 
-static auto as_jsonable(const SecureDataCredentials &credentials) {
+static auto as_jsonable_data(const SecureDataCredentials &credentials) {
   return json_object([&credentials](auto &o) {
     o("data_hash", base64_encode(credentials.hash));
     o("secret", base64_encode(credentials.secret));
   });
 }
 
-static auto as_jsonable(const SecureFileCredentials &credentials) {
+static auto as_jsonable_file(const SecureFileCredentials &credentials) {
   return json_object([&credentials](auto &o) {
     o("file_hash", base64_encode(credentials.hash));
     o("secret", base64_encode(credentials.secret));
   });
 }
 
-static auto as_jsonable(const vector<SecureFileCredentials> &files) {
-  return json_array([&files](auto &arr) {
-    for (auto &file : files) {
-      arr(as_jsonable(file));
-    }
-  });
+static auto as_jsonable_files(const vector<SecureFileCredentials> &files) {
+  return json_array(files, as_jsonable_file);
 }
 
 static Slice secure_value_type_as_slice(SecureValueType type) {
@@ -1436,27 +1426,27 @@ static auto credentials_as_jsonable(const std::vector<SecureValueCredentials> &c
 
           o(secure_value_type_as_slice(cred.type), json_object([&cred](auto &o) {
               if (cred.data) {
-                o("data", as_jsonable(cred.data.value()));
+                o("data", as_jsonable_data(cred.data.value()));
               }
               if (!cred.files.empty()) {
-                o("files", as_jsonable(cred.files));
+                o("files", as_jsonable_files(cred.files));
               }
               if (cred.front_side) {
-                o("front_side", as_jsonable(cred.front_side.value()));
+                o("front_side", as_jsonable_file(cred.front_side.value()));
               }
               if (cred.reverse_side) {
-                o("reverse_side", as_jsonable(cred.reverse_side.value()));
+                o("reverse_side", as_jsonable_file(cred.reverse_side.value()));
               }
               if (cred.selfie) {
-                o("selfie", as_jsonable(cred.selfie.value()));
+                o("selfie", as_jsonable_file(cred.selfie.value()));
               }
               if (!cred.translations.empty()) {
-                o("translation", as_jsonable(cred.translations));
+                o("translation", as_jsonable_files(cred.translations));
               }
             }));
         }
       }));
-    o(rename_payload_to_nonce ? "nonce" : "payload", nonce);
+    o(rename_payload_to_nonce ? Slice("nonce") : Slice("payload"), nonce);
   });
 }
 
